@@ -2,10 +2,10 @@
 
 from setuptools import setup, find_packages
 
-with open('README.rst') as infile:
+with open('README.rst', encoding='utf-8') as infile:
     readme = infile.read()
 
-with open('lazy_import/VERSION') as infile:
+with open('lazy_import/VERSION', encoding='utf-8') as infile:
     version = infile.read().strip()
 
 tests_require = ['pytest', 'pytest-xdist']
