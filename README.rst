@@ -1,7 +1,6 @@
 lazy_import
 ===========
 
-|Build Status|
 
 ``lazy_import`` provides a set of functions that load modules, and related
 attributes, in a lazy fashion. This allows deferring of ``ImportErrors`` to
