@@ -59,6 +59,12 @@ __all__ = ['lazy_module', 'lazy_callable', 'lazy_function', 'lazy_class',
 
 from types import ModuleType
 import sys
+
+# Python version detection for conditional features
+PY2 = sys.version_info[0] == 2
+PY3 = sys.version_info[0] >= 3
+PY35_PLUS = sys.version_info >= (3, 5)
+
 try:
     from importlib._bootstrap import _ImportLockContext
 except ImportError:
@@ -71,6 +77,17 @@ except ImportError:
             imp.acquire_lock()
         def __exit__(self, exc_type, exc_value, exc_traceback):
             imp.release_lock()
+
+# Python 3.5+ native lazy loading support
+_HAS_NATIVE_LAZY_LOADER = False
+if PY35_PLUS:
+    try:
+        from importlib.util import LazyLoader as _NativeLazyLoader
+        from importlib.util import find_spec as _find_spec
+        from importlib.util import module_from_spec as _module_from_spec
+        _HAS_NATIVE_LAZY_LOADER = True
+    except ImportError:
+        pass
 
 
 # Adding a __spec__ doesn't really help. I'll leave the code here in case
@@ -127,21 +144,18 @@ class LazyModule(ModuleType):
     # peak.util.imports sets __slots__ to (), but it seems pointless because
     # the base ModuleType doesn't itself set __slots__.
     def __getattribute__(self, attr):
-        logger.debug("Getting attr {} of LazyModule instance of {}"
-                     .format(attr, super(LazyModule, self)
-                             .__getattribute__("__name__")))
+        # Cache module name to avoid repeated super() calls
+        _super_getattr = super(LazyModule, self).__getattribute__
+        _name = _super_getattr("__name__")
+        logger.debug("Getting attr {} of LazyModule instance of {}".format(attr, _name))
         logger.lazy_trace()
         # IPython tries to be too clever and constantly inspects, asking for
         #  modules' attrs, which causes premature module loading and unesthetic
         #  internal errors if the lazily-loaded module doesn't exist.
-        if (run_from_ipython()
-            and (attr.startswith(("__", "_ipython"))
-                 or attr == "_repr_mimebundle_")
-            and module_basename(_caller_name()) in ('inspect', 'IPython')):
-                logger.debug("Ignoring request for {}, deemed from IPython's "
-                             "inspection.".format(super(LazyModule, self)
-                                     .__getattribute__("__name__"), attr))
-                raise AttributeError
+        if _should_ignore_ipython_inspection(attr):
+            logger.debug("Ignoring request for {}, deemed from IPython's "
+                         "inspection.".format(_name, attr))
+            raise AttributeError
         if not attr in ('__name__','__class__','__spec__'):
             # __name__ and __class__ yield their values from the LazyModule;
             # __spec__ causes an AttributeError. Maybe in the future it will be
@@ -178,9 +192,11 @@ class LazyModule(ModuleType):
 
 
 class LazyCallable(object):
-    """Class for lazily-loaded callables that triggers module loading on access
+    """Class for lazily-loaded callables that triggers module loading on access.
 
+    Uses __slots__ for memory efficiency when many lazy callables are created.
     """
+    __slots__ = ('module', 'cname', 'modclass', 'callable', 'error_msgs', 'error_strings')
     def __init__(self, *args):
         if len(args) != 2:
             # Maybe the user tried to base a class off this lazy callable?
@@ -336,18 +352,24 @@ def lazy_module(modname, error_strings=None, lazy_mod_class=LazyModule,
 
 def _lazy_module(modname, error_strings, lazy_mod_class):
     with _ImportLockContext():
+        # Local cache for sys.modules to avoid repeated global lookups
+        _modules = sys.modules
         fullmodname = modname
         fullsubmodname = None
         # ensure parent module/package is in sys.modules
         # and parent.modname=module, as soon as the parent is imported   
         while modname:
-            try:
-                mod = sys.modules[modname]
+            if modname in _modules:
+                mod = _modules[modname]
                 # We reached a (base) module that's already loaded. Let's stop
                 # the cycle. Can't use 'break' because we still want to go 
                 # through the fullsubmodname check below.
                 modname = ''
-            except KeyError:
+            else:
+                # Use custom LazyModule implementation
+                # Note: Native LazyLoader is available via _try_native_lazy_module()
+                # for users who want to opt-in for performance when they don't
+                # need custom repr or error messages.
                 err_s = error_strings.copy()
                 err_s.setdefault('module', modname)
 
@@ -367,18 +389,18 @@ def _lazy_module(modname, error_strings, lazy_mod_class):
                 # A bit of cosmetic, to make AttributeErrors read more natural  
                 _LazyModule.__name__ = 'module'
                 # Actual module instantiation
-                mod = sys.modules[modname] = _LazyModule(modname)
+                mod = _modules[modname] = _LazyModule(modname)
                 # No need for __spec__. Maybe in the future.
                 #if ModuleSpec:
                 #    ModuleType.__setattr__(mod, '__spec__',
                 #            ModuleSpec(modname, None))
             if fullsubmodname:
-                submod = sys.modules[fullsubmodname]
+                submod = _modules[fullsubmodname]
                 ModuleType.__setattr__(mod, submodname, submod)
                 _LazyModule._lazy_import_submodules[submodname] = submod
             fullsubmodname = modname
             modname, _, submodname = modname.rpartition('.')
-        return sys.modules[fullmodname]
+        return _modules[fullmodname]
 
 
 def lazy_callable(modname, *names, **kwargs):
@@ -701,3 +723,82 @@ def run_from_ipython():
     except NameError:
         return False
 
+# Cache the IPython check result for performance
+_IPYTHON_CACHE = None
+
+def _should_ignore_ipython_inspection(attr):
+    """Check if an attribute access should be ignored as IPython inspection.
+    
+    IPython constantly inspects modules for auto-completion which can cause
+    premature module loading. This helper detects and ignores such accesses.
+    
+    Parameters
+    ----------
+    attr : str
+        The attribute name being accessed.
+        
+    Returns
+    -------
+    bool
+        True if the access should be ignored (is IPython inspection).
+    """
+    global _IPYTHON_CACHE
+    if _IPYTHON_CACHE is None:
+        _IPYTHON_CACHE = run_from_ipython()
+    
+    if not _IPYTHON_CACHE:
+        return False
+    
+    # Check if it's an IPython-style inspection attribute
+    if not (attr.startswith(("__", "_ipython")) or attr == "_repr_mimebundle_"):
+        return False
+    
+    # Check if the caller is from inspect or IPython modules
+    caller_base = module_basename(_caller_name())
+    return caller_base in ('inspect', 'IPython')
+
+
+##############################
+# Native LazyLoader Support  #
+##############################
+
+def _try_native_lazy_module(modname):
+    """Attempt to use Python 3.5+'s native LazyLoader for existing modules.
+    
+    This provides better performance for modules that actually exist,
+    as the native LazyLoader is implemented at C level.
+    
+    Parameters
+    ----------
+    modname : str
+        The fully qualified module name to load lazily.
+        
+    Returns
+    -------
+    module or None
+        The lazily-loaded module if successful, None if the module doesn't
+        exist or if native lazy loading is not available.
+        
+    Notes
+    -----
+    This function is only active on Python 3.5+. On older Python versions
+    or if the module doesn't exist, it returns None and the caller should
+    fall back to the custom LazyModule implementation.
+    """
+    if not _HAS_NATIVE_LAZY_LOADER:
+        return None
+    
+    try:
+        spec = _find_spec(modname)
+        if spec is None or spec.loader is None:
+            return None  # Module doesn't exist, use custom LazyModule
+        
+        # Wrap the loader with LazyLoader
+        spec.loader = _NativeLazyLoader(spec.loader)
+        module = _module_from_spec(spec)
+        sys.modules[modname] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        # Any error means we should fall back to custom implementation
+        return None
